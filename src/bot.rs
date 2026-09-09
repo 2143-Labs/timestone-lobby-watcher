@@ -448,7 +448,7 @@ mod tests {
         }
         let st = WatcherState {
             prev,
-            absent: Vec::new(),
+            absent: std::collections::HashMap::new(),
             poll_index: 12,
             pending: false,
             request_sent: Instant::now(),

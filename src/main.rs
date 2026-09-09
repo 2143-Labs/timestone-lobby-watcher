@@ -70,7 +70,7 @@ impl Lobby {
 
 pub(crate) struct WatcherState {
     pub(crate) prev: HashMap<u64, Lobby>,
-    absent: Vec<u64>, // ids absent from the immediately previous poll
+    absent: HashMap<u64, Lobby>, // first-missed last poll -> last-seen data (deletion grace check)
     pub(crate) poll_index: u64,
     pending: bool, // a lobby-list request is in flight
     request_sent: Instant,
@@ -160,16 +160,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d)
 }
 
-fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) {
+fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) -> (u32, u32, u32) {
     let mut created = 0u32;
     let mut updated = 0u32;
     let mut deleted = 0u32;
-    let mut absent_now: Vec<u64> = Vec::new();
     let mut next_prev: HashMap<u64, Lobby> = HashMap::new();
+    let mut absent_next: HashMap<u64, Lobby> = HashMap::new();
 
     for lobby in &current {
         next_prev.insert(lobby.id, lobby.clone());
         match state.prev.get(&lobby.id) {
+            // Back after a one-poll blip: neither new nor worth a deletion.
+            None if state.absent.contains_key(&lobby.id) => {}
             None => {
                 emit_event("created", lobby);
                 append_lobby_event(&state.lobby_log, "created", lobby);
@@ -182,16 +184,22 @@ fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) {
             _ => {}
         }
     }
+    // Seen last poll, missing now: first absence - remember the last-seen
+    // snapshot so a second consecutive absence can be reported as deleted.
     for lobby in state.prev.values() {
-        if next_prev.contains_key(&lobby.id) {
+        if !next_prev.contains_key(&lobby.id) {
+            absent_next.insert(lobby.id, lobby.clone());
+        }
+    }
+    // Missing last poll already and still missing: destroyed (one-poll blip
+    // grace). Back again = revived, and skipped in the created loop above.
+    for (id, last_seen) in &state.absent {
+        if next_prev.contains_key(id) {
             continue;
         }
-        absent_now.push(lobby.id);
-        if state.absent.contains(&lobby.id) {
-            emit_event("deleted", lobby);
-            append_lobby_event(&state.lobby_log, "deleted", lobby);
-            deleted += 1;
-        }
+        emit_event("deleted", last_seen);
+        append_lobby_event(&state.lobby_log, "deleted", last_seen);
+        deleted += 1;
     }
 
     tracing::info!(
@@ -205,8 +213,9 @@ fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) {
         "lobby poll complete",
     );
     state.prev = next_prev;
-    state.absent = absent_now;
+    state.absent = absent_next;
     state.last_poll = Instant::now();
+    (created, updated, deleted)
 }
 
 fn main() {
@@ -237,7 +246,7 @@ fn main() {
 
     let state = Arc::new(Mutex::new(WatcherState {
         prev: HashMap::new(),
-        absent: Vec::new(),
+        absent: HashMap::new(),
         poll_index: 0,
         pending: false,
         request_sent: Instant::now(),
@@ -326,7 +335,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{lobby_log_line, utc_from_epoch, Lobby};
+    use super::*;
 
     #[test]
     fn utc_from_epoch_is_rfc3339_utc() {
@@ -357,5 +366,65 @@ mod tests {
              name=\"Party \\\"Up\\\"\" host=\"John\\tDoe\" \
              protocol=\"1\" members=2 owner=76561198000000000"
         );
+    }
+
+    /// A watcher whose previous poll saw exactly `prev` and that has no
+    /// lobbies pending a deletion-grace check.
+    fn watcher_with(prev: HashMap<u64, Lobby>) -> WatcherState {
+        WatcherState {
+            prev,
+            absent: HashMap::new(),
+            poll_index: 0,
+            pending: false,
+            request_sent: Instant::now(),
+            next_poll: Instant::now(),
+            last_poll: Instant::now(),
+            lobby_log: PathBuf::new(),
+        }
+    }
+
+    fn lobby(id: u64) -> Lobby {
+        Lobby {
+            id,
+            name: format!("lobby {id}"),
+            host: "host".to_string(),
+            protocol: "0.3.6".to_string(),
+            members: 1,
+            owner: 76561198027378405,
+        }
+    }
+
+    #[test]
+    fn new_lobby_is_reported_created_and_then_kept() {
+        let mut st = watcher_with(HashMap::new());
+        let (created, _, _) = process_poll(&mut st, vec![lobby(1)]);
+        assert_eq!(created, 1);
+        // Still open next poll: neither created again nor deleted.
+        let (created, _, deleted) = process_poll(&mut st, vec![lobby(1)]);
+        assert_eq!((created, deleted), (0, 0));
+    }
+
+    #[test]
+    fn deleted_fires_after_two_consecutive_absent_polls() {
+        let mut st = watcher_with(HashMap::from([(7, lobby(7))]));
+        // First poll without lobby 7: only remembered, not yet deleted.
+        let (created, updated, deleted) = process_poll(&mut st, vec![]);
+        assert_eq!((created, updated, deleted), (0, 0, 0));
+        assert_eq!(st.absent.len(), 1);
+        // Second consecutive poll without it: deleted.
+        let (created, updated, deleted) = process_poll(&mut st, vec![]);
+        assert_eq!((created, updated, deleted), (0, 0, 1));
+        assert!(st.absent.is_empty());
+    }
+
+    #[test]
+    fn one_poll_blip_is_neither_created_nor_deleted() {
+        let mut st = watcher_with(HashMap::from([(7, lobby(7))]));
+        // Missing for one poll: not deleted.
+        let (_, _, deleted) = process_poll(&mut st, vec![]);
+        assert_eq!(deleted, 0);
+        // Back one poll later: revived, not re-created (and not deleted).
+        let (created, _, deleted) = process_poll(&mut st, vec![lobby(7)]);
+        assert_eq!((created, deleted), (0, 0));
     }
 }
