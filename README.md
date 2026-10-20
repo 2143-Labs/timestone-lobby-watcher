@@ -27,6 +27,14 @@ nix develop                  # sets STEAM_SDK_LOCATION + LD_LIBRARY_PATH
 cargo run
 ```
 
+## Self-recovery
+
+If no lobby poll completes for 120 s the watcher logs `event="stalled"` and
+exits with status 1. The NixOS wrapper that runs it on the steam VM
+(`lobby-watcher-up`) respawns it after 10 s, which re-initialises the
+Steamworks client. This recovers from a wedged Steamworks callback pipe, where
+the process stays alive but no callback is ever delivered again.
+
 ## Lobby lifecycle log
 
 The watcher appends one plain-text line to `./lobby-watcher.log` every time a
@@ -52,7 +60,7 @@ Running 24/7 (e.g. a NixOS box where Steam stays up):
 
 ```bash
   $(nix build --no-link --print-out-paths .)/bin/lobby-watcher
-journalctl --user -u lobby-watcher -f   # logs land here
+tail -f ~/.local/state/lobby-watcher.log   # where the wrapper writes
 ```
 
 ## Discord bot (optional)
@@ -97,6 +105,7 @@ Target `lobby_watcher`, filter on `event`:
 | `search_failed` | - |
 | `created` / `updated` / `deleted` | `lobby.id`, `lobby.name`, `lobby.host`, `lobby.protocol`, `lobby.members`, `lobby.owner` (host SteamID64 - join links need it) |
 | `poll` | `poll`, `total`, `created`, `deleted`, `updated` |
+| `stalled` | `idle_secs` (the process then exits 1; the supervisor restarts it) |
 | `card_start` / `card_disabled` | `channel` |
 | `card_found` / `card_recreated` | `message` |
 | `card_error` | `reason` + `channel` (when known); `status`/`phase` when applicable |

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,12 @@ pub(crate) const APP_ID: u32 = 357190; // Ultimate Marvel vs. Capcom 3
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const SEARCH_DEADLINE: Duration = Duration::from_secs(20);
 const INIT_RETRY: Duration = Duration::from_secs(5);
+/// Exit when no lobby poll completes for this long. The XDG-autostart wrapper
+/// in dotfiles/nixos/steam-configuration.nix respawns the process after 10 s,
+/// which is the only reliable recovery from a wedged Steamworks callback pipe.
+const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often the watchdog thread checks the heartbeat.
+const STALL_CHECK: Duration = Duration::from_secs(5);
 const MAX_RESULTS: u64 = 50;
 pub(crate) const EVENT_TARGET: &str = "lobby_watcher";
 /// Env var for where the lifecycle log file is written.
@@ -77,6 +84,13 @@ pub(crate) struct WatcherState {
     next_poll: Instant,
     pub(crate) last_poll: Instant,
     lobby_log: PathBuf, // created/deleted events are appended here as text
+}
+
+/// True when no poll has completed within `timeout`. Both values are
+/// milliseconds since the same process-local `Instant`, so a system clock jump
+/// cannot trigger a false restart; a heartbeat ahead of `now` is never stale.
+fn poll_is_stale(now_ms: u64, last_poll_ms: u64, timeout: Duration) -> bool {
+    now_ms.saturating_sub(last_poll_ms) > timeout.as_millis() as u64
 }
 
 fn emit_event(event: &str, lobby: &Lobby) {
@@ -220,6 +234,7 @@ fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) -> (u32, u32, u32
 
 fn main() {
     tracing_subscriber::fmt::init();
+    let started = Instant::now();
 
     let client = loop {
         match Client::init_app(APP_ID) {
@@ -236,6 +251,30 @@ fn main() {
         }
     };
     let mm = client.matchmaking();
+
+    // Steamworks delivers callbacks through the single-threaded loop below. If
+    // its IPC pipe wedges, `run_callbacks` keeps returning while no callback is
+    // ever delivered again (observed 2026-10-20: 11.5 h with no poll and no
+    // error). A separate thread watches the last completed poll and exits,
+    // because only a fresh process re-initialises Steamworks. It holds no lock
+    // on `WatcherState`, so it still runs if the main loop deadlocks.
+    let last_poll_ms = Arc::new(AtomicU64::new(started.elapsed().as_millis() as u64));
+    let watchdog_beat = Arc::clone(&last_poll_ms);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(STALL_CHECK);
+        let now_ms = started.elapsed().as_millis() as u64;
+        let beat = watchdog_beat.load(Ordering::Relaxed);
+        if poll_is_stale(now_ms, beat, STALL_TIMEOUT) {
+            let idle_secs = now_ms.saturating_sub(beat) / 1000;
+            tracing::error!(
+                target: EVENT_TARGET,
+                event = "stalled",
+                idle_secs,
+                "no successful lobby poll in {idle_secs} s - exiting so the supervisor starts a fresh Steamworks client",
+            );
+            std::process::exit(1);
+        }
+    });
 
     // Plain-text history of created/deleted lobbies. Override the location
     // with LOBBY_LOG_FILE; the watcher never needs the log to keep polling.
@@ -303,6 +342,7 @@ fn main() {
             });
             let state2 = Arc::clone(&state);
             let client2 = client.clone();
+            let beat = Arc::clone(&last_poll_ms);
             mm.request_lobby_list(move |res: SResult<Vec<LobbyId>>| {
                 let mut st = state2.lock();
                 st.pending = false;
@@ -313,6 +353,7 @@ fn main() {
                             ids.iter().map(|id| Lobby::read(&mm, *id)).collect();
                         st.poll_index += 1;
                         process_poll(&mut st, current);
+                        beat.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     }
                     Err(e) => tracing::warn!(
                         target: EVENT_TARGET,
@@ -426,5 +467,15 @@ mod tests {
         // Back one poll later: revived, not re-created (and not deleted).
         let (created, _, deleted) = process_poll(&mut st, vec![lobby(7)]);
         assert_eq!((created, deleted), (0, 0));
+    }
+
+    #[test]
+    fn stall_fires_only_after_the_timeout() {
+        let timeout = Duration::from_secs(120);
+        // Exactly at the deadline is not yet stale.
+        assert!(!poll_is_stale(120_000, 0, timeout));
+        assert!(poll_is_stale(120_001, 0, timeout));
+        // A heartbeat newer than `now` (clock reset) is never stale.
+        assert!(!poll_is_stale(1_000, 5_000, timeout));
     }
 }
