@@ -35,6 +35,10 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the watchdog thread checks the heartbeat.
 const STALL_CHECK: Duration = Duration::from_secs(5);
 const MAX_RESULTS: u64 = 50;
+/// Lobby-data key every Timestone v0.6+ room sets to "1". The game's own room
+/// search (UMVC3Hook/code/steam_lobby.cpp, SteamLobby_Search) applies no
+/// open-slot filter, so full rooms stay listed and are not mistaken for closed.
+const LOBBY_KEY: &str = "TimestoneRoom";
 pub(crate) const EVENT_TARGET: &str = "lobby_watcher";
 /// Env var for where the lifecycle log file is written.
 const LOBBY_LOG_ENV: &str = "LOBBY_LOG_FILE";
@@ -48,7 +52,8 @@ pub(crate) struct Lobby {
     pub(crate) host: String,
     pub(crate) protocol: String,
     pub(crate) members: usize,
-    pub(crate) owner: u64, // SteamID64 of the lobby owner - join links need it
+    pub(crate) max_members: Option<usize>, // lobby member limit; None when Steam has no metadata
+    pub(crate) owner: u64,                 // SteamID64 of the lobby owner - join links need it
 }
 
 impl Lobby {
@@ -60,6 +65,7 @@ impl Lobby {
             host: data("username"),
             protocol: data("protocol"),
             members: mm.lobby_member_count(id),
+            max_members: mm.lobby_member_limit(id),
             owner: mm.lobby_owner(id).raw(),
         }
     }
@@ -172,6 +178,19 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
     (y, m as u32, d)
+}
+
+fn lobby_search_filter() -> LobbyListFilter<'static> {
+    LobbyListFilter {
+        string: Some(vec![StringFilter(
+            LobbyKey::new(LOBBY_KEY),
+            "1",
+            StringFilterKind::Equal,
+        )]),
+        distance: Some(DistanceFilter::Worldwide),
+        count: Some(MAX_RESULTS),
+        ..Default::default()
+    }
 }
 
 fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) -> (u32, u32, u32) {
@@ -329,17 +348,7 @@ fn main() {
             st.pending = true;
             st.request_sent = now;
             st.next_poll = now + POLL_INTERVAL; // next scheduled search
-            mm.set_lobby_list_filter(LobbyListFilter {
-                string: Some(vec![StringFilter(
-                    LobbyKey::new("Timestone"),
-                    "1",
-                    StringFilterKind::Equal,
-                )]),
-                open_slots: Some(1),
-                distance: Some(DistanceFilter::Worldwide),
-                count: Some(MAX_RESULTS),
-                ..Default::default()
-            });
+            mm.set_lobby_list_filter(lobby_search_filter());
             let state2 = Arc::clone(&state);
             let client2 = client.clone();
             let beat = Arc::clone(&last_poll_ms);
@@ -399,6 +408,7 @@ mod tests {
             host: "John\tDoe".to_string(),
             protocol: "1".to_string(),
             members: 2,
+            max_members: Some(8),
             owner: 76561198000000000,
         };
         assert_eq!(
@@ -431,8 +441,26 @@ mod tests {
             host: "host".to_string(),
             protocol: "0.3.6".to_string(),
             members: 1,
+            max_members: Some(8),
             owner: 76561198027378405,
         }
+    }
+
+    #[test]
+    fn search_filter_targets_v06_rooms() {
+        assert_eq!(
+            lobby_search_filter(),
+            LobbyListFilter {
+                string: Some(vec![StringFilter(
+                    LobbyKey::new("TimestoneRoom"),
+                    "1",
+                    StringFilterKind::Equal,
+                )]),
+                distance: Some(DistanceFilter::Worldwide),
+                count: Some(50),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

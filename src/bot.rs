@@ -96,6 +96,16 @@ pub fn join_link(l: &Lobby) -> String {
     format!("{JOIN_BASE_URL}/{APP_ID}/{}/{}", l.id, l.owner)
 }
 
+/// "2/8 players", "8/8 players (full)", or "3 players" when Steam reports no
+/// member limit. Timestone v0.6 rooms hold 2-8 members, so the limit varies.
+fn player_count(l: &Lobby) -> String {
+    match l.max_members {
+        Some(max) if l.members >= max => format!("{}/{} players (full)", l.members, max),
+        Some(max) => format!("{}/{} players", l.members, max),
+        None => format!("{} players", l.members),
+    }
+}
+
 /// The /mm embed: one field per open lobby (busiest first), each with a join
 /// link. The description carries a live "Updated <t:…:R>" line - Discord
 /// renders timestamp tags in descriptions (but not in footers, which are
@@ -115,9 +125,9 @@ fn build_mm_embed(lobbies: &[Lobby], poll_index: u64, updated_unix: u64) -> sere
             e = e.field(
                 format!("{} - {}", l.name, l.host),
                 format!(
-                    "protocol {} • {}/8 players\n[Join lobby]({})",
+                    "protocol {} • {}\n[Join lobby]({})",
                     l.protocol,
-                    l.members,
+                    player_count(l),
                     join_link(l)
                 ),
                 false,
@@ -366,6 +376,7 @@ mod tests {
             host: "host".into(),
             protocol: "0.2.9".into(),
             members: 1,
+            max_members: Some(8),
             owner,
         }
     }
@@ -377,6 +388,18 @@ mod tests {
             join_link(&l),
             "https://mm.b.hero.rehab/joinlobby/357190/109775244078428410/76561198027378405"
         );
+    }
+
+    #[test]
+    fn player_count_uses_member_limit() {
+        let mut l = lobby("a", 1, 2);
+        l.members = 2;
+        assert_eq!(player_count(&l), "2/8 players");
+        l.members = 8;
+        assert_eq!(player_count(&l), "8/8 players (full)");
+        l.members = 3;
+        l.max_members = None;
+        assert_eq!(player_count(&l), "3 players");
     }
 
     #[test]
@@ -394,6 +417,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("https://mm.b.hero.rehab/joinlobby/"));
+        assert!(json["fields"][0]["value"]
+            .as_str()
+            .unwrap()
+            .contains("1/8 players"));
     }
 
     #[test]
@@ -442,6 +469,7 @@ mod tests {
                     host: "host".into(),
                     protocol: "0.2.9".into(),
                     members,
+                    max_members: Some(8),
                     owner: 76561198027378405,
                 },
             );

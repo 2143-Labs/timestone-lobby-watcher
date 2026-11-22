@@ -2,10 +2,11 @@
 
 Standalone home of the lobby-watcher service (moved out of the Timestone-dev
 monorepo). Private dev tool (not shipped to players). Headless service that
-polls **all Timestone lobbies** (every version - no protocol filter) every 15 s
-through the public Steamworks lobby-search API. Emits structured **tracing
-events** as log lines, and optionally runs a Discord bot with slash commands
-(set `DISCORD_TOKEN`).
+polls **all Timestone v0.6+ rooms** (lobby key `TimestoneRoom=1`, full rooms
+included, no protocol filter) every 15 s through the public Steamworks
+lobby-search API. Pre-0.6 lobbies (`Timestone=1`) are not watched. Emits
+structured **tracing events** as log lines, and optionally runs a Discord bot
+with slash commands (set `DISCORD_TOKEN`).
 
 ## How it runs
 
