@@ -12,7 +12,7 @@ mod bot;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -53,7 +53,29 @@ pub(crate) struct Lobby {
     pub(crate) protocol: String,
     pub(crate) members: usize,
     pub(crate) max_members: Option<usize>, // lobby member limit; None when Steam has no metadata
-    pub(crate) owner: u64,                 // SteamID64 of the lobby owner - join links need it
+    pub(crate) owner: u64, // SteamID64 of the lobby owner (host-claimed for searched rooms, see owner_id) - join links need it
+}
+
+/// Every individual-account SteamID64: universe 1 (public), type 1
+/// (individual), instance 1, account id 1..=u32::MAX.
+const STEAMID64_INDIVIDUAL: std::ops::RangeInclusive<u64> =
+    76_561_197_960_265_729..=76_561_202_255_233_023;
+
+/// Owner SteamID64 for a lobby found by search. Steam reports the owner only
+/// to lobby members, so `steam_owner` is 0 for searched lobbies; Timestone
+/// v0.6.1+ rooms publish their owner's id under "hid" for the lobby list
+/// (UMVC3Hook/code/lobby_room.cpp, PublishHostIcon). "hid" is host-claimed:
+/// any room can name any account, so the result only targets join links and
+/// must never be treated as proof of who hosts the room. Anything that is not
+/// an individual SteamID64 stays 0.
+fn owner_id(steam_owner: u64, hid: &str) -> u64 {
+    if steam_owner != 0 {
+        return steam_owner;
+    }
+    hid.parse()
+        .ok()
+        .filter(|id| STEAMID64_INDIVIDUAL.contains(id))
+        .unwrap_or(0)
 }
 
 impl Lobby {
@@ -66,7 +88,7 @@ impl Lobby {
             protocol: data("protocol"),
             members: mm.lobby_member_count(id),
             max_members: mm.lobby_member_limit(id),
-            owner: mm.lobby_owner(id).raw(),
+            owner: owner_id(mm.lobby_owner(id).raw(), &data("hid")),
         }
     }
 
@@ -252,7 +274,10 @@ fn process_poll(state: &mut WatcherState, current: Vec<Lobby>) -> (u32, u32, u32
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // Colour only on a terminal: the autostart wrapper appends output to a file.
+    tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
     let started = Instant::now();
 
     let client = loop {
@@ -461,6 +486,19 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn owner_id_falls_back_to_hid() {
+        assert_eq!(owner_id(0, "76561198027378405"), 76561198027378405);
+        assert_eq!(owner_id(5, "76561198027378405"), 5);
+        assert_eq!(owner_id(0, ""), 0);
+        assert_eq!(owner_id(0, "abc"), 0);
+        assert_eq!(owner_id(0, "99999999999999999999999"), 0);
+        assert_eq!(owner_id(0, "1"), 0);
+        assert_eq!(owner_id(0, "76561197960265728"), 0);
+        assert_eq!(owner_id(0, "76561202255233023"), 76561202255233023);
+        assert_eq!(owner_id(0, "76561202255233024"), 0);
     }
 
     #[test]

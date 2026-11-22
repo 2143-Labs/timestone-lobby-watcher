@@ -52,13 +52,11 @@ pub fn run(token: &str, state: Arc<Mutex<WatcherState>>) {
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            let client = serenity::Client::builder(
-                token.to_string(),
-                serenity::GatewayIntents::non_privileged(),
-            )
-            .activity(serenity::ActivityData::watching("Timestone lobbies"))
-            .framework(framework)
-            .await;
+            let client =
+                serenity::Client::builder(token, serenity::GatewayIntents::non_privileged())
+                    .activity(serenity::ActivityData::watching("Timestone lobbies"))
+                    .framework(framework)
+                    .await;
             match client {
                 Ok(mut client) => {
                     // Live lobby card: a background task renders once per poll
@@ -96,6 +94,36 @@ pub fn join_link(l: &Lobby) -> String {
     format!("{JOIN_BASE_URL}/{APP_ID}/{}/{}", l.id, l.owner)
 }
 
+/// Caps for host-written lobby text in the embed. Steam persona names are at
+/// most 32 characters; the game's own lobby list keeps 63-byte names
+/// (UMVC3Hook/code/lobby_model.h kNameCapacity).
+const MAX_NAME_CHARS: usize = 64;
+const MAX_HOST_CHARS: usize = 32;
+const MAX_PROTOCOL_CHARS: usize = 32;
+
+/// Lobby data is written by whoever hosts the room. Replace control
+/// characters with spaces, cap the length, and backslash-escape Discord
+/// markdown so crafted text cannot render as a masked link, heading, quote,
+/// list or formatting. Bare URLs still auto-link but show where they go.
+fn discord_safe(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if i == max_chars {
+            out.push('…');
+            break;
+        }
+        let c = if c.is_control() { ' ' } else { c };
+        if matches!(
+            c,
+            '\\' | '*' | '_' | '~' | '`' | '|' | '>' | '#' | '-' | '[' | ']' | '(' | ')' | '<'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// "2/8 players", "8/8 players (full)", or "3 players" when Steam reports no
 /// member limit. Timestone v0.6 rooms hold 2-8 members, so the limit varies.
 fn player_count(l: &Lobby) -> String {
@@ -123,10 +151,14 @@ fn build_mm_embed(lobbies: &[Lobby], poll_index: u64, updated_unix: u64) -> sere
     } else {
         for l in lobbies.iter().take(25) {
             e = e.field(
-                format!("{} - {}", l.name, l.host),
+                format!(
+                    "{} - {}",
+                    discord_safe(&l.name, MAX_NAME_CHARS),
+                    discord_safe(&l.host, MAX_HOST_CHARS)
+                ),
                 format!(
                     "protocol {} • {}\n[Join lobby]({})",
-                    l.protocol,
+                    discord_safe(&l.protocol, MAX_PROTOCOL_CHARS),
                     player_count(l),
                     join_link(l)
                 ),
@@ -166,7 +198,7 @@ fn unix_now() -> u64 {
 /// `<t:…:R>` tag so the client keeps the relative clock fresh.
 fn lobby_snapshot(state: &WatcherState) -> (Vec<Lobby>, u64, u64) {
     let mut lobbies: Vec<Lobby> = state.prev.values().cloned().collect();
-    lobbies.sort_by(|a, b| b.members.cmp(&a.members));
+    lobbies.sort_by_key(|l| std::cmp::Reverse(l.members));
     let updated_unix = unix_now().saturating_sub(state.last_poll.elapsed().as_secs());
     (lobbies, state.poll_index, updated_unix)
 }
@@ -400,6 +432,33 @@ mod tests {
         l.members = 3;
         l.max_members = None;
         assert_eq!(player_count(&l), "3 players");
+    }
+
+    #[test]
+    fn discord_safe_escapes_markdown() {
+        assert_eq!(
+            discord_safe("[Join](https://evil.example)", 64),
+            r"\[Join\]\(https://evil.example\)"
+        );
+        assert_eq!(discord_safe("# big\n> quote", 64), r"\# big \> quote");
+        assert_eq!(
+            discord_safe("**b** _i_ ~~s~~ `c` ||x||", 64),
+            r"\*\*b\*\* \_i\_ \~\~s\~\~ \`c\` \|\|x\|\|"
+        );
+        assert_eq!(discord_safe("BLEZ's Lobby", 64), "BLEZ's Lobby");
+        assert_eq!(discord_safe("abcdef", 3), "abc…");
+        assert_eq!(discord_safe("abc", 3), "abc");
+    }
+
+    #[test]
+    fn embed_escapes_host_text() {
+        let mut l = lobby("x", 1, 2);
+        l.protocol = "[x](https://evil.example)".into();
+        let e = build_mm_embed(&[l], 1, 1_700_000_000);
+        let json = serde_json::to_value(&e).unwrap();
+        let value = json["fields"][0]["value"].as_str().unwrap();
+        assert!(value.contains(r"\[x\]\(https://evil.example\)"));
+        assert!(!value.contains("[x]("));
     }
 
     #[test]
