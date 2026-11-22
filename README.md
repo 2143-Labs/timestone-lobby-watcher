@@ -17,7 +17,8 @@ Prerequisites - on the machine running it:
   is no server-side equivalent. Without this, the service logs `event="init_failed"`
   every 5 s and retries.
 - No config, no flags, no `steam_appid.txt`. One instance per machine. Logs go
-  to stderr; Ctrl+C stops it.
+  to stdout, coloured only when stdout is a terminal (plain text when the
+  wrapper appends to a file); Ctrl+C stops it.
 
 ```bash
 nix run .                    # built binary, logs to the terminal
@@ -72,7 +73,9 @@ used, which can take up to an hour to propagate).
 
 - `/mm` - posts a complex embed listing every open Timestone lobby (busiest
   first): one field per lobby with name, host, protocol, player count, and a
-  `https://mm.b.hero.rehab/joinlobby/…` join link for each lobby.
+  `https://mm.b.hero.rehab/joinlobby/…` join link for each lobby. Name, host
+  and protocol are written by whoever hosts the room, so the embed escapes
+  Discord markdown in them and caps their length (no injected masked links).
 
 - **Live lobby card** - set `DISCORD_LOBBY_CHANNEL_ID` (a text-channel
   snowflake, right-click → Copy Channel ID) and the bot keeps a single message
@@ -104,7 +107,7 @@ Target `lobby_watcher`, filter on `event`:
 | `start` | - |
 | `init_failed` | - |
 | `search_failed` | - |
-| `created` / `updated` / `deleted` | `lobby.id`, `lobby.name`, `lobby.host`, `lobby.protocol`, `lobby.members`, `lobby.owner` (host SteamID64 - join links need it) |
+| `created` / `updated` / `deleted` | `lobby.id`, `lobby.name`, `lobby.host`, `lobby.protocol`, `lobby.members`, `lobby.owner` (host SteamID64 for join links; 0 when unknown) |
 | `poll` | `poll`, `total`, `created`, `deleted`, `updated` |
 | `stalled` | `idle_secs` (the process then exits 1; the supervisor restarts it) |
 | `card_start` / `card_disabled` | `channel` |
@@ -114,6 +117,12 @@ Target `lobby_watcher`, filter on `event`:
 Diff semantics: `created` = new id; `updated` = name/host/protocol/members/
 owner changed; `deleted` = absent for 2 consecutive polls (blip grace). No ping
 field (steamworks 0.13.1 exposes none).
+
+`lobby.owner` / `owner=`: Steam reports a lobby's owner only to its members,
+so for searched rooms the watcher falls back to the room's `hid` lobby data
+(Timestone v0.6.1+), accepted only if it is an individual SteamID64. `hid` is
+**host-claimed** - a room can name any account - so use it for join links
+only, never as proof of who hosts the room.
 
 ## Build notes
 
