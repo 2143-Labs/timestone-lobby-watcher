@@ -124,13 +124,25 @@ fn discord_safe(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// "2/8 players", "8/8 players (full)", or "3 players" when Steam reports no
+/// "1/7 players", "7/7 players (full)", or "2 players" when Steam reports no
 /// member limit. Timestone v0.6 rooms hold 2-8 members, so the limit varies.
+///
+/// One of those members is a placeholder the hook keeps in the room so Steam
+/// does not destroy the lobby, and the member limit counts it too: Steam's
+/// figures are both one too high for players looking at Discord, so both are
+/// shown one lower. The rest of the watcher keeps Steam's raw counts.
 fn player_count(l: &Lobby) -> String {
+    let players = l.members.saturating_sub(1);
     match l.max_members {
-        Some(max) if l.members >= max => format!("{}/{} players (full)", l.members, max),
-        Some(max) => format!("{}/{} players", l.members, max),
-        None => format!("{} players", l.members),
+        Some(max) => {
+            let slots = max.saturating_sub(1);
+            if players >= slots {
+                format!("{players}/{slots} players (full)")
+            } else {
+                format!("{players}/{slots} players")
+            }
+        }
+        None => format!("{players} players"),
     }
 }
 
@@ -423,15 +435,19 @@ mod tests {
     }
 
     #[test]
-    fn player_count_uses_member_limit() {
+    fn player_count_hides_the_placeholder_slot() {
         let mut l = lobby("a", 1, 2);
         l.members = 2;
-        assert_eq!(player_count(&l), "2/8 players");
+        assert_eq!(player_count(&l), "1/7 players");
         l.members = 8;
-        assert_eq!(player_count(&l), "8/8 players (full)");
+        assert_eq!(player_count(&l), "7/7 players (full)");
         l.members = 3;
         l.max_members = None;
-        assert_eq!(player_count(&l), "3 players");
+        assert_eq!(player_count(&l), "2 players");
+        // A room holding only the placeholder has no players in it.
+        l.max_members = Some(8);
+        l.members = 1;
+        assert_eq!(player_count(&l), "0/7 players");
     }
 
     #[test]
@@ -479,7 +495,7 @@ mod tests {
         assert!(json["fields"][0]["value"]
             .as_str()
             .unwrap()
-            .contains("1/8 players"));
+            .contains("0/7 players"));
     }
 
     #[test]
