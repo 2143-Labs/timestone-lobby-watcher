@@ -92,6 +92,18 @@ If the server runs a third-party message-logging bot (YAGPDB, Carl-bot, …),
 add the lobby-card channel (or this bot) to the logger's ignore list - every
 15 s card edit would otherwise be recorded as a log entry (~5,760/day).
 
+Player counts on Discord read one lower than Steam reports. Every Timestone
+room keeps a placeholder member in it so Steam does not destroy the lobby, and
+the member limit counts that member too, so the embed shows `members - 1` of
+`limit - 1` ("1/7 players", "7/7 players (full)"). The structured events and
+`lobby-watcher.log` keep Steam's raw numbers.
+
+Updating a deployed watcher: it is built into the system closure through the
+`timestone-lobby-watcher` flake input in dotfiles, and the `lobby-watcher-up`
+wrapper has the old binary's store path baked in. After `nixos-rebuild switch`
+restart the graphical session (or reboot) so the autostart wrapper relaunches
+the new binary, then check `readlink /proc/$(pgrep -x lobby-watcher)/exe`.
+
 The bot fails gracefully: a bad token logs `event="discord_error"` and the
 watcher keeps polling.
 
